@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>QR P2P WebRTC Signaling</title>
+  <!-- 圧縮・QR生成・QR読取ライブラリ (CDN) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 12px; margin: 0; background: #f4f6f8; color: #222; }
+    h2 { font-size: 1rem; margin: 0 0 8px 0; }
+    .card { background: #fff; padding: 12px; border-radius: 8px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    button { padding: 10px; width: 100%; font-size: 14px; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; margin: 4px 0; }
+    .btn-caller { background: #007aff; color: #fff; }
+    .btn-callee { background: #5856d6; color: #fff; }
+    .btn-cam { background: #ff9500; color: #fff; }
+    #status { font-weight: bold; padding: 8px; border-radius: 6px; text-align: center; margin-bottom: 8px; font-size: 13px; }
+    .status-wait { background: #e5e5ea; color: #333; }
+    .status-ok { background: #34c759; color: #fff; }
+    .status-err { background: #ff3b30; color: #fff; }
+    #qrContainer { display: flex; justify-content: center; padding: 10px; background: #fff; }
+    #videoContainer { position: relative; width: 100%; height: 220px; background: #000; border-radius: 6px; overflow: hidden; display: none; }
+    video { width: 100%; height: 100%; object-fit: cover; }
+    #log { border: 1px solid #ddd; height: 110px; overflow-y: scroll; padding: 6px; background: #fff; font-size: 11px; font-family: monospace; border-radius: 4px; }
+  </style>
+</head>
+<body>
+
+  <div id="status" class="status-wait">役割を選択してください</div>
+
+  <!-- 1. 役割選択 -->
+  <div class="card" id="roleSection">
+    <h2>1. 役割の選択</h2>
+    <button class="btn-caller" onclick="startAsCaller()">端末 A (Offer を提示する)</button>
+    <button class="btn-callee" onclick="startAsCallee()">端末 B (Answer を返す)</button>
+  </div>
+
+  <!-- QRコード表示エリア -->
+  <div class="card" id="qrCard" style="display:none;">
+    <h2 id="qrTitle">QRコード</h2>
+    <div id="qrContainer"></div>
+    <div style="font-size:11px; color:#666; text-align:center;" id="qrSubtext"></div>
+  </div>
+
+  <!-- カメラ読取エリア -->
+  <div class="card" id="camCard" style="display:none;">
+    <h2>カメラで相手のQRコードをスキャン</h2>
+    <button class="btn-cam" id="camBtn" onclick="toggleCamera()">カメラを起動</button>
+    <div id="videoContainer">
+      <video id="video" playsinline></video>
+      <canvas id="canvas" style="display:none;"></canvas>
+    </div>
+  </div>
+
+  <!-- チャット送受信エリア（キープアライブ内蔵） -->
+  <div class="card">
+    <h2>2. データ通信テスト</h2>
+    <div style="display:flex; gap:6px;">
+      <input type="text" id="msgInput" placeholder="メッセージ" style="flex:1; padding:8px; border:1px solid #ccc; border-radius:4px;" disabled>
+      <button id="sendBtn" class="btn-caller" style="width:70px; margin:0;" onclick="sendMsg()" disabled>送信</button>
+    </div>
+    <div style="margin-top:8px;">
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <script>
+    const rtcConfig = {
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    };
+
+    let pc = null;
+    let dataChannel = null;
+    let myRole = null; // 'caller' or 'callee'
+    let heartbeatTimer = null;
+    let videoStream = null;
+    let scanning = false;
+
+    function setStatus(text, type) {
+      const el = document.getElementById('status');
+      el.innerText = text;
+      el.className = type === 'ok' ? 'status-ok' : (type === 'err' ? 'status-err' : 'status-wait');
+    }
+
+    function log(msg) {
+      const el = document.getElementById('log');
+      el.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+      el.scrollTop = el.scrollHeight;
+    }
+
+    // SDPの軽量化（不要な行を削除してQRの密度を下げる）
+    function minimizeSdp(sdp) {
+      return sdp.split('\r\n')
+        .filter(line => {
+          if (!line) return false;
+          // 不要なメタ情報・不要プロトコル記述の排除
+          if (line.startsWith('a=rtcp:')) return false;
+          if (line.startsWith('a=extmap:')) return false;
+          if (line.startsWith('a=msid-semantic:')) return false;
+          return true;
+        }).join('\r\n') + '\r\n';
+    }
+
+    // SDP -> 圧縮Base64
+    function compressSdp(type, sdp) {
+      const cleanSdp = minimizeSdp(sdp);
+      const payload = JSON.stringify({ t: type === 'offer' ? 'o' : 'a', s: cleanSdp });
+      const compressed = pako.deflate(payload);
+      return btoa(String.fromCharCode.apply(null, compressed));
+    }
+
+    // 圧縮Base64 -> SDP
+    function decompressSdp(base64) {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const decompressed = pako.inflate(bytes, { to: 'string' });
+      const obj = JSON.parse(decompressed);
+      return {
+        type: obj.t === 'o' ? 'offer' : 'answer',
+        sdp: obj.s
+      };
+    }
+
+    // QRコード描画
+    function renderQRCode(text, title, subtext) {
+      document.getElementById('qrCard').style.display = 'block';
+      document.getElementById('qrTitle').innerText = title;
+      document.getElementById('qrSubtext').innerText = subtext;
+      const container = document.getElementById('qrContainer');
+      container.innerHTML = '';
+      new QRCode(container, {
+        text: text,
+        width: 240,
+        height: 240,
+        correctLevel: QRCode.CorrectLevel.L // 容量最大化のため誤り訂正L
+      });
+    }
+
+    function createPeerConnection() {
+      pc = new RTCPeerConnection(rtcConfig);
+
+      pc.oniceconnectionstatechange = () => {
+        log(`ICE状態: ${pc.iceConnectionState}`);
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          setStatus('★ 5G直接P2P開通！', 'ok');
+          document.getElementById('qrCard').style.display = 'none';
+          stopCamera();
+        } else if (pc.iceConnectionState === 'failed') {
+          setStatus('接続失敗 (Timeout/NAT制限)', 'err');
+        }
+      };
+
+      pc.ondatachannel = (e) => setupDataChannel(e.channel);
+    }
+
+    function setupDataChannel(channel) {
+      dataChannel = channel;
+      dataChannel.onopen = () => {
+        log('DataChannel 開通');
+        document.getElementById('msgInput').disabled = false;
+        document.getElementById('sendBtn').disabled = false;
+
+        // NATバインディング切れ防止用キープアライブ（4秒間隔）
+        heartbeatTimer = setInterval(() => {
+          if (dataChannel && dataChannel.readyState === 'open') {
+            dataChannel.send(JSON.stringify({ type: 'hb' }));
+          }
+        }, 4000);
+      };
+
+      dataChannel.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.type === 'hb') return; // キープアライブは無視
+        } catch (_) {}
+        log(`受信: ${e.data}`);
+      };
+
+      dataChannel.onclose = () => {
+        log('DataChannel 切断');
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        document.getElementById('msgInput').disabled = true;
+        document.getElementById('sendBtn').disabled = true;
+      };
+    }
+
+    function waitForIceGathering(peer) {
+      return new Promise((resolve) => {
+        if (peer.iceGatheringState === 'complete') resolve();
+        else {
+          const fn = () => {
+            if (peer.iceGatheringState === 'complete') {
+              peer.removeEventListener('icegatheringstatechange', fn);
+              resolve();
+            }
+          };
+          peer.addEventListener('icegatheringstatechange', fn);
+          setTimeout(() => { peer.removeEventListener('icegatheringstatechange', fn); resolve(); }, 4000);
+        }
+      });
+    }
+
+    // --- 端末 A (Caller) 処理 ---
+    async function startAsCaller() {
+      myRole = 'caller';
+      document.getElementById('roleSection').style.display = 'none';
+      setStatus('端末 A: Offer生成中...', 'wait');
+
+      createPeerConnection();
+      const dc = pc.createDataChannel('chat', { ordered: true });
+      setupDataChannel(dc);
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGathering(pc);
+
+      const compressed = compressSdp('offer', pc.localDescription.sdp);
+      renderQRCode(compressed, '端末 A の QRコード (Offer)', '端末 B のカメラでこのコードを読み取ってください');
+
+      // 端末BのAnswerを読み取るためカメラ起動を促す
+      document.getElementById('camCard').style.display = 'block';
+      setStatus('端末 B がスキャン後、生成するQRを本端末でスキャンしてください', 'wait');
+    }
+
+    // --- 端末 B (Callee) 処理 ---
+    function startAsCallee() {
+      myRole = 'callee';
+      document.getElementById('roleSection').style.display = 'none';
+      createPeerConnection();
+
+      // まず端末AのOfferを読み取るためにカメラ起動
+      document.getElementById('camCard').style.display = 'block';
+      setStatus('端末 A の QRコードをスキャンしてください', 'wait');
+      startCamera();
+    }
+
+    // --- カメラ / QRスキャナ処理 ---
+    async function toggleCamera() {
+      if (scanning) stopCamera();
+      else startCamera();
+    }
+
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment' } // 背面カメラ指定
+        });
+        videoStream = stream;
+        const video = document.getElementById('video');
+        video.srcObject = stream;
+        video.setAttribute('playsinline', true);
+        await video.play();
+
+        document.getElementById('videoContainer').style.display = 'block';
+        document.getElementById('camBtn').innerText = 'カメラを停止';
+        scanning = true;
+        requestAnimationFrame(tickScan);
+      } catch (err) {
+        alert('カメラ起動エラー: ' + err.message);
+      }
+    }
+
+    function stopCamera() {
+      scanning = false;
+      if (videoStream) {
+        videoStream.getTracks().forEach(t => t.stop());
+        videoStream = null;
+      }
+      document.getElementById('videoContainer').style.display = 'none';
+      document.getElementById('camBtn').innerText = 'カメラを起動';
+    }
+
+    async function tickScan() {
+      if (!scanning) return;
+      const video = document.getElementById('video');
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        const canvas = document.getElementById('canvas');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imgData.data, imgData.width, imgData.height, {
+          inversionAttempts: 'dontInvert'
+        });
+
+        if (code && code.data) {
+          log('QRコードを検出・デコード中...');
+          stopCamera();
+          await handleQrData(code.data);
+          return;
+        }
+      }
+      requestAnimationFrame(tickScan);
+    }
+
+    async function handleQrData(base64) {
+      try {
+        const remote = decompressSdp(base64);
+
+        if (myRole === 'callee' && remote.type === 'offer') {
+          // 端末Bが端末AのOfferを受信
+          await pc.setRemoteDescription(new RTCSessionDescription(remote));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          await waitForIceGathering(pc);
+
+          const compressedAnswer = compressSdp('answer', pc.localDescription.sdp);
+          renderQRCode(compressedAnswer, '端末 B の QRコード (Answer)', '端末 A のカメラでこのコードを読み取ってください');
+          setStatus('端末 A にこのQRを読み取らせてください', 'wait');
+
+        } else if (myRole === 'caller' && remote.type === 'answer') {
+          // 端末Aが端末BのAnswerを受信
+          await pc.setRemoteDescription(new RTCSessionDescription(remote));
+          setStatus('Answerを適用しました。P2P接続確立中...', 'wait');
+        }
+      } catch (err) {
+        alert('QRデータの解析に失敗しました: ' + err.message);
+      }
+    }
+
+    function sendMsg() {
+      const input = document.getElementById('msgInput');
+      const val = input.value.trim();
+      if (val && dataChannel && dataChannel.readyState === 'open') {
+        dataChannel.send(val);
+        log(`送信: ${val}`);
+        input.value = '';
+      }
+    }
+  </script>
+</body>
+</html>
