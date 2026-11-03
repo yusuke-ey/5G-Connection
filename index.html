@@ -3,27 +3,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>QR P2P WebRTC Signaling</title>
-  <!-- 圧縮・QR生成・QR読取ライブラリ (CDN) -->
+  <title>Self-Healing WebRTC P2P</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 12px; margin: 0; background: #f4f6f8; color: #222; }
-    h2 { font-size: 1rem; margin: 0 0 8px 0; }
-    .card { background: #fff; padding: 12px; border-radius: 8px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-    button { padding: 10px; width: 100%; font-size: 14px; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; margin: 4px 0; }
+    h2 { font-size: 0.95rem; margin: 0 0 6px 0; }
+    .card { background: #fff; padding: 10px; border-radius: 8px; margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    button { padding: 9px; width: 100%; font-size: 13px; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; margin: 3px 0; }
     .btn-caller { background: #007aff; color: #fff; }
     .btn-callee { background: #5856d6; color: #fff; }
     .btn-cam { background: #ff9500; color: #fff; }
+    .btn-heal { background: #ff3b30; color: #fff; }
     #status { font-weight: bold; padding: 8px; border-radius: 6px; text-align: center; margin-bottom: 8px; font-size: 13px; }
     .status-wait { background: #e5e5ea; color: #333; }
     .status-ok { background: #34c759; color: #fff; }
     .status-err { background: #ff3b30; color: #fff; }
-    #qrContainer { display: flex; justify-content: center; padding: 10px; background: #fff; }
-    #videoContainer { position: relative; width: 100%; height: 220px; background: #000; border-radius: 6px; overflow: hidden; display: none; }
+    .status-warn { background: #ffcc00; color: #333; }
+    #qrContainer { display: flex; justify-content: center; padding: 6px; background: #fff; }
+    #videoContainer { position: relative; width: 100%; height: 200px; background: #000; border-radius: 6px; overflow: hidden; display: none; }
     video { width: 100%; height: 100%; object-fit: cover; }
-    #log { border: 1px solid #ddd; height: 110px; overflow-y: scroll; padding: 6px; background: #fff; font-size: 11px; font-family: monospace; border-radius: 4px; }
+    #log { border: 1px solid #ddd; height: 100px; overflow-y: scroll; padding: 6px; background: #fff; font-size: 11px; font-family: monospace; border-radius: 4px; }
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 10px; font-size: 10px; background: #eee; margin-left: 4px; }
   </style>
 </head>
 <body>
@@ -33,33 +35,44 @@
   <!-- 1. 役割選択 -->
   <div class="card" id="roleSection">
     <h2>1. 役割の選択</h2>
-    <button class="btn-caller" onclick="startAsCaller()">端末 A (Offer を提示する)</button>
-    <button class="btn-callee" onclick="startAsCallee()">端末 B (Answer を返す)</button>
+    <button class="btn-caller" onclick="startAsCaller()">端末 A (Offer側 / Caller)</button>
+    <button class="btn-callee" onclick="startAsCallee()">端末 B (Answer側 / Callee)</button>
+  </div>
+
+  <!-- 自己修復・再接続パネル (切断時に自動展開) -->
+  <div class="card" id="healingCard" style="display:none; border: 2px solid #ff9500;">
+    <h2>自己修復 (ICE Restart)</h2>
+    <div id="healingMessage" style="font-size:12px; margin-bottom:6px; color:#d9534f;"></div>
+    <button class="btn-heal" id="restartBtn" onclick="triggerIceRestart()">ICE Restart を実行してQRを更新</button>
   </div>
 
   <!-- QRコード表示エリア -->
   <div class="card" id="qrCard" style="display:none;">
     <h2 id="qrTitle">QRコード</h2>
     <div id="qrContainer"></div>
-    <div style="font-size:11px; color:#666; text-align:center;" id="qrSubtext"></div>
+    <div style="font-size:11px; color:#666; text-align:center; margin-top:4px;" id="qrSubtext"></div>
   </div>
 
-  <!-- カメラ読取エリア -->
+  <!-- スキャンエリア -->
   <div class="card" id="camCard" style="display:none;">
-    <h2>カメラで相手のQRコードをスキャン</h2>
-    <button class="btn-cam" id="camBtn" onclick="toggleCamera()">カメラを起動</button>
+    <h2>相手のQRコードをスキャン</h2>
+    <button class="btn-cam" id="camBtn" onclick="toggleCamera()">カメラで連続スキャン</button>
+    <div style="margin-top:6px; font-size:11px; color:#555;">
+      ※カメラ権限エラー時は写真選択で読取:
+      <input type="file" id="fileQrInput" accept="image/*" capture="environment" style="margin-top:4px; width:100%;">
+    </div>
     <div id="videoContainer">
       <video id="video" playsinline></video>
       <canvas id="canvas" style="display:none;"></canvas>
     </div>
   </div>
 
-  <!-- チャット送受信エリア（キープアライブ内蔵） -->
+  <!-- チャット送受信 & 未送信保留キュー -->
   <div class="card">
-    <h2>2. データ通信テスト</h2>
+    <h2>2. データ通信 <span id="queueBadge" class="badge">保留キュー: 0件</span></h2>
     <div style="display:flex; gap:6px;">
-      <input type="text" id="msgInput" placeholder="メッセージ" style="flex:1; padding:8px; border:1px solid #ccc; border-radius:4px;" disabled>
-      <button id="sendBtn" class="btn-caller" style="width:70px; margin:0;" onclick="sendMsg()" disabled>送信</button>
+      <input type="text" id="msgInput" placeholder="メッセージ (切断中もキューに蓄積)" style="flex:1; padding:8px; border:1px solid #ccc; border-radius:4px;">
+      <button id="sendBtn" class="btn-caller" style="width:70px; margin:0;" onclick="handleSendAction()">送信</button>
     </div>
     <div style="margin-top:8px;">
       <div id="log"></div>
@@ -73,15 +86,18 @@
 
     let pc = null;
     let dataChannel = null;
-    let myRole = null; // 'caller' or 'callee'
+    let myRole = null; // 'caller' | 'callee'
     let heartbeatTimer = null;
     let videoStream = null;
     let scanning = false;
 
+    // --- メカニズム3: 未送信ローカルキュー (Outbox) ---
+    let pendingMessageQueue = [];
+
     function setStatus(text, type) {
       const el = document.getElementById('status');
       el.innerText = text;
-      el.className = type === 'ok' ? 'status-ok' : (type === 'err' ? 'status-err' : 'status-wait');
+      el.className = type === 'ok' ? 'status-ok' : (type === 'err' ? 'status-err' : (type === 'warn' ? 'status-warn' : 'status-wait'));
     }
 
     function log(msg) {
@@ -90,101 +106,166 @@
       el.scrollTop = el.scrollHeight;
     }
 
-    // SDPの軽量化（不要な行を削除してQRの密度を下げる）
+    function updateQueueUI() {
+      document.getElementById('queueBadge').innerText = `保留キュー: ${pendingMessageQueue.length}件`;
+    }
+
+    // --- SDP圧縮処理 ---
     function minimizeSdp(sdp) {
-      return sdp.split('\r\n')
-        .filter(line => {
-          if (!line) return false;
-          // 不要なメタ情報・不要プロトコル記述の排除
-          if (line.startsWith('a=rtcp:')) return false;
-          if (line.startsWith('a=extmap:')) return false;
-          if (line.startsWith('a=msid-semantic:')) return false;
-          return true;
-        }).join('\r\n') + '\r\n';
+      return sdp.split('\r\n').filter(line => {
+        if (!line) return false;
+        if (line.startsWith('a=rtcp:')) return false;
+        if (line.startsWith('a=extmap:')) return false;
+        if (line.startsWith('a=msid-semantic:')) return false;
+        return true;
+      }).join('\r\n') + '\r\n';
     }
 
-    // SDP -> 圧縮Base64
     function compressSdp(type, sdp) {
-      const cleanSdp = minimizeSdp(sdp);
-      const payload = JSON.stringify({ t: type === 'offer' ? 'o' : 'a', s: cleanSdp });
-      const compressed = pako.deflate(payload);
-      return btoa(String.fromCharCode.apply(null, compressed));
+      const payload = JSON.stringify({ t: type === 'offer' ? 'o' : 'a', s: minimizeSdp(sdp) });
+      return btoa(String.fromCharCode.apply(null, pako.deflate(payload)));
     }
 
-    // 圧縮Base64 -> SDP
     function decompressSdp(base64) {
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const decompressed = pako.inflate(bytes, { to: 'string' });
-      const obj = JSON.parse(decompressed);
-      return {
-        type: obj.t === 'o' ? 'offer' : 'answer',
-        sdp: obj.s
-      };
+      const bytes = new Uint8Array(atob(base64).split('').map(c => c.charCodeAt(0)));
+      const obj = JSON.parse(pako.inflate(bytes, { to: 'string' }));
+      return { type: obj.t === 'o' ? 'offer' : 'answer', sdp: obj.s };
     }
 
-    // QRコード描画
     function renderQRCode(text, title, subtext) {
       document.getElementById('qrCard').style.display = 'block';
       document.getElementById('qrTitle').innerText = title;
       document.getElementById('qrSubtext').innerText = subtext;
       const container = document.getElementById('qrContainer');
       container.innerHTML = '';
-      new QRCode(container, {
-        text: text,
-        width: 240,
-        height: 240,
-        correctLevel: QRCode.CorrectLevel.L // 容量最大化のため誤り訂正L
-      });
+      new QRCode(container, { text: text, width: 220, height: 220, correctLevel: QRCode.CorrectLevel.L });
     }
 
+    // --- メカニズム1: 切断検知ロジック ---
     function createPeerConnection() {
       pc = new RTCPeerConnection(rtcConfig);
 
       pc.oniceconnectionstatechange = () => {
-        log(`ICE状態: ${pc.iceConnectionState}`);
+        log(`ICE状態遷移: ${pc.iceConnectionState}`);
+
         if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-          setStatus('★ 5G直接P2P開通！', 'ok');
+          setStatus('★ 5G直接P2P通信中', 'ok');
+          document.getElementById('healingCard').style.display = 'none';
           document.getElementById('qrCard').style.display = 'none';
           stopCamera();
+        } else if (pc.iceConnectionState === 'disconnected') {
+          setStatus('切断検知: 自然復旧を待機中...', 'warn');
         } else if (pc.iceConnectionState === 'failed') {
-          setStatus('接続失敗 (Timeout/NAT制限)', 'err');
+          setStatus('通信完全切断: 自己修復が必要', 'err');
+          onConnectionLost();
         }
       };
 
       pc.ondatachannel = (e) => setupDataChannel(e.channel);
     }
 
+    function onConnectionLost() {
+      document.getElementById('healingCard').style.display = 'block';
+      document.getElementById('healingMessage').innerText = 'NAT経路が閉鎖されました。ICE Restartで再接続してください。';
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+    }
+
+    // --- メカニズム2: ICE Restart (経路の再構築) ---
+    async function triggerIceRestart() {
+      if (!pc) return;
+      log('自己修復: ICE Restartシーケンスを開始...');
+      try {
+        if (myRole === 'caller') {
+          // Caller側から新しい経路要求(Offer)を発行
+          const restartOffer = await pc.createOffer({ iceRestart: true });
+          await pc.setLocalDescription(restartOffer);
+          await waitForIceGathering(pc);
+
+          const compressed = compressSdp('offer', pc.localDescription.sdp);
+          renderQRCode(compressed, '再接続用 QRコード (ICE Restart)', '端末BでこのQRをスキャンしてください');
+          document.getElementById('camCard').style.display = 'block';
+          setStatus('端末Bのスキャン後、端末BのQRを再スキャンしてください', 'wait');
+        } else {
+          // Callee側は待機し、相手のRestart Offerをスキャンする
+          document.getElementById('camCard').style.display = 'block';
+          setStatus('端末Aの再接続QRコードをスキャンしてください', 'wait');
+          startCamera();
+        }
+      } catch (err) {
+        log(`ICE Restart失敗: ${err.message}`);
+      }
+    }
+
     function setupDataChannel(channel) {
       dataChannel = channel;
-      dataChannel.onopen = () => {
-        log('DataChannel 開通');
-        document.getElementById('msgInput').disabled = false;
-        document.getElementById('sendBtn').disabled = false;
 
-        // NATバインディング切れ防止用キープアライブ（4秒間隔）
+      dataChannel.onopen = () => {
+        log('★ DataChannel 開通');
+        // キープアライブ開始 (4秒間隔)
         heartbeatTimer = setInterval(() => {
           if (dataChannel && dataChannel.readyState === 'open') {
             dataChannel.send(JSON.stringify({ type: 'hb' }));
           }
         }, 4000);
+
+        // --- メカニズム3: 再接続時の保留キュー一括フラッシュ ---
+        flushPendingQueue();
       };
 
       dataChannel.onmessage = (e) => {
         try {
-          const data = JSON.parse(e.data);
-          if (data.type === 'hb') return; // キープアライブは無視
+          const payload = JSON.parse(e.data);
+          if (payload.type === 'hb') return;
+          if (payload.type === 'msg') {
+            log(`[受信 #${payload.seq}]: ${payload.text}`);
+            return;
+          }
         } catch (_) {}
-        log(`受信: ${e.data}`);
+        log(`[生データ受信]: ${e.data}`);
       };
 
       dataChannel.onclose = () => {
-        log('DataChannel 切断');
+        log('DataChannel 閉鎖');
         if (heartbeatTimer) clearInterval(heartbeatTimer);
-        document.getElementById('msgInput').disabled = true;
-        document.getElementById('sendBtn').disabled = true;
       };
+    }
+
+    // --- メカニズム3: キューイングと送信制御 ---
+    let sequenceNumber = 1;
+
+    function handleSendAction() {
+      const input = document.getElementById('msgInput');
+      const text = input.value.trim();
+      if (!text) return;
+
+      const packet = {
+        type: 'msg',
+        seq: sequenceNumber++,
+        text: text,
+        timestamp: Date.now()
+      };
+
+      if (dataChannel && dataChannel.readyState === 'open') {
+        dataChannel.send(JSON.stringify(packet));
+        log(`[送信済 #${packet.seq}]: ${packet.text}`);
+      } else {
+        // 切断中ならローカルキューに保持
+        pendingMessageQueue.push(packet);
+        updateQueueUI();
+        log(`[キューに保留 #${packet.seq}]: ${packet.text}`);
+      }
+      input.value = '';
+    }
+
+    function flushPendingQueue() {
+      if (pendingMessageQueue.length === 0) return;
+      log(`再開: 保留されていたメッセージ ${pendingMessageQueue.length} 件を一括送信中...`);
+      while (pendingMessageQueue.length > 0) {
+        const packet = pendingMessageQueue.shift();
+        dataChannel.send(JSON.stringify(packet));
+        log(`[遅延送信完了 #${packet.seq}]: ${packet.text}`);
+      }
+      updateQueueUI();
     }
 
     function waitForIceGathering(peer) {
@@ -203,13 +284,12 @@
       });
     }
 
-    // --- 端末 A (Caller) 処理 ---
+    // --- 初期化フロー ---
     async function startAsCaller() {
       myRole = 'caller';
       document.getElementById('roleSection').style.display = 'none';
-      setStatus('端末 A: Offer生成中...', 'wait');
-
       createPeerConnection();
+
       const dc = pc.createDataChannel('chat', { ordered: true });
       setupDataChannel(dc);
 
@@ -218,26 +298,20 @@
       await waitForIceGathering(pc);
 
       const compressed = compressSdp('offer', pc.localDescription.sdp);
-      renderQRCode(compressed, '端末 A の QRコード (Offer)', '端末 B のカメラでこのコードを読み取ってください');
-
-      // 端末BのAnswerを読み取るためカメラ起動を促す
+      renderQRCode(compressed, '端末 A の QRコード (Offer)', '端末 B でスキャンしてください');
       document.getElementById('camCard').style.display = 'block';
-      setStatus('端末 B がスキャン後、生成するQRを本端末でスキャンしてください', 'wait');
     }
 
-    // --- 端末 B (Callee) 処理 ---
     function startAsCallee() {
       myRole = 'callee';
       document.getElementById('roleSection').style.display = 'none';
       createPeerConnection();
-
-      // まず端末AのOfferを読み取るためにカメラ起動
       document.getElementById('camCard').style.display = 'block';
       setStatus('端末 A の QRコードをスキャンしてください', 'wait');
       startCamera();
     }
 
-    // --- カメラ / QRスキャナ処理 ---
+    // --- カメラ & フォールバック読取 ---
     async function toggleCamera() {
       if (scanning) stopCamera();
       else startCamera();
@@ -245,9 +319,7 @@
 
     async function startCamera() {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment' } // 背面カメラ指定
-        });
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
         videoStream = stream;
         const video = document.getElementById('video');
         video.srcObject = stream;
@@ -259,7 +331,7 @@
         scanning = true;
         requestAnimationFrame(tickScan);
       } catch (err) {
-        alert('カメラ起動エラー: ' + err.message);
+        alert('カメラ起動失敗 (下のファイル選択を使用してください): ' + err.message);
       }
     }
 
@@ -270,7 +342,7 @@
         videoStream = null;
       }
       document.getElementById('videoContainer').style.display = 'none';
-      document.getElementById('camBtn').innerText = 'カメラを起動';
+      document.getElementById('camBtn').innerText = 'カメラで連続スキャン';
     }
 
     async function tickScan() {
@@ -283,52 +355,65 @@
         const ctx = canvas.getContext('2d');
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const code = jsQR(imgData.data, imgData.width, imgData.height, {
-          inversionAttempts: 'dontInvert'
-        });
+        const code = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: 'dontInvert' });
 
         if (code && code.data) {
-          log('QRコードを検出・デコード中...');
           stopCamera();
-          await handleQrData(code.data);
+          await handleScannedData(code.data);
           return;
         }
       }
       requestAnimationFrame(tickScan);
     }
 
-    async function handleQrData(base64) {
+    // 写真選択フォールバック
+    document.getElementById('fileQrInput').addEventListener('change', function(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(event) {
+        const img = new Image();
+        img.onload = function() {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0);
+          const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const code = jsQR(imgData.data, imgData.width, imgData.height);
+          if (code && code.data) {
+            handleScannedData(code.data);
+          } else {
+            alert('QRコードが認識できませんでした。撮影し直してください。');
+          }
+        };
+        img.src = event.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+
+    async function handleScannedData(base64) {
       try {
         const remote = decompressSdp(base64);
 
-        if (myRole === 'callee' && remote.type === 'offer') {
-          // 端末Bが端末AのOfferを受信
+        if (remote.type === 'offer') {
+          // Callee側がOfferを受信（初回またはICE Restart時）
           await pc.setRemoteDescription(new RTCSessionDescription(remote));
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
           await waitForIceGathering(pc);
 
-          const compressedAnswer = compressSdp('answer', pc.localDescription.sdp);
-          renderQRCode(compressedAnswer, '端末 B の QRコード (Answer)', '端末 A のカメラでこのコードを読み取ってください');
-          setStatus('端末 A にこのQRを読み取らせてください', 'wait');
+          const compressed = compressSdp('answer', pc.localDescription.sdp);
+          renderQRCode(compressed, '端末 B の QRコード (Answer)', '端末 A でこのQRをスキャンしてください');
+          setStatus('端末 A に読み取らせてください', 'wait');
 
-        } else if (myRole === 'caller' && remote.type === 'answer') {
-          // 端末Aが端末BのAnswerを受信
+        } else if (remote.type === 'answer') {
+          // Caller側がAnswerを受信（初回またはICE Restart時）
           await pc.setRemoteDescription(new RTCSessionDescription(remote));
-          setStatus('Answerを適用しました。P2P接続確立中...', 'wait');
+          setStatus('再接続ハンドシェイク完了。開通待機中...', 'wait');
         }
       } catch (err) {
-        alert('QRデータの解析に失敗しました: ' + err.message);
-      }
-    }
-
-    function sendMsg() {
-      const input = document.getElementById('msgInput');
-      const val = input.value.trim();
-      if (val && dataChannel && dataChannel.readyState === 'open') {
-        dataChannel.send(val);
-        log(`送信: ${val}`);
-        input.value = '';
+        log(`QR処理エラー: ${err.message}`);
       }
     }
   </script>
